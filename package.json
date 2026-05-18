@@ -1,0 +1,45 @@
+{
+  "name": "thurbox-v2",
+  "version": "0.0.0-dev",
+  "description": "Thurbox v2 — TypeScript + Ink rewrite of the multi-session Claude Code TUI orchestrator. Hot-reloadable, tmux-persistent.",
+  "license": "MIT",
+  "type": "module",
+  "private": true,
+  "bin": {
+    "thurbox": "./src/index.tsx"
+  },
+  "scripts": {
+    "dev": "bun --hot run src/index.tsx",
+    "start": "bun run src/index.tsx",
+    "build": "bun build src/index.tsx --compile --target=bun --outfile=dist/thurbox",
+    "typecheck": "tsc --noEmit",
+    "lint": "biome check .",
+    "lint:fix": "biome check --write .",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "clipboardy": "^4.0.0",
+    "commander": "^12.1.0",
+    "fuse.js": "^7.0.0",
+    "ink": "^5.1.0",
+    "react": "^18.3.1",
+    "xterm-headless": "^5.3.0",
+    "zustand": "^5.0.2"
+  },
+  "optionalDependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "better-sqlite3": "^11.7.0",
+    "node-pty": "^1.0.0"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^1.9.4",
+    "@types/better-sqlite3": "^7.6.12",
+    "@types/bun": "latest",
+    "@types/react": "^18.3.12",
+    "ink-testing-library": "^4.0.0",
+    "typescript": "^5.9.3",
+    "vitest": "^2.1.8"
+  },
+  "trustedDependencies": ["@biomejs/biome"]
+}
