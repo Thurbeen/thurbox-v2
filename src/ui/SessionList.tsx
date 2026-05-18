@@ -16,9 +16,11 @@ interface Props {
   focused: boolean;
   /** Pre-filtered list (when fuzzy search is active) or undefined to show all. */
   filtered?: ReturnType<typeof useApp.getState>['sessions'];
+  /** Outer width in cells, including the border. */
+  width: number;
 }
 
-export function SessionList({ theme, focused, filtered }: Props) {
+export function SessionList({ theme, focused, filtered, width }: Props) {
   const sessions = useApp((s) => s.sessions);
   const activeId = useApp((s) => s.activeSessionId);
   const visible = filtered ?? sessions;
@@ -26,12 +28,12 @@ export function SessionList({ theme, focused, filtered }: Props) {
   return (
     <Box
       flexDirection="column"
-      borderStyle={focused ? 'round' : 'single'}
+      borderStyle="single"
       borderColor={focused ? theme.borderFocused : theme.borderUnfocused}
       paddingX={1}
-      minWidth={24}
+      width={width}
     >
-      <Text bold color={theme.accent}>
+      <Text bold color={focused ? theme.accent : theme.text}>
         Sessions
       </Text>
       {visible.length === 0 ? (

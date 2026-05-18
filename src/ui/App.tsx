@@ -1,26 +1,25 @@
 /**
  * Root component.
  *
- * Boots the tmux backend + SQLite DB, spawns one demo session so the M6
- * milestone has something to navigate, runs the snapshot poll loop, and
- * dispatches global keybindings.
+ * Layout (matches v1 thurbox):
  *
- * Global keys (mirrors v1's vim-inspired set):
- *   Ctrl+Q  quit
- *   Ctrl+N  new session (M6b — currently spawns a 2nd demo shell)
- *   Ctrl+J  next session in sidebar
- *   Ctrl+K  prev session
- *   Ctrl+L  focus terminal
- *   Ctrl+H  focus sidebar
- *   Ctrl+D  close active session
- *   Ctrl+Y / F4  theme picker
- *   /       (sidebar focus) open fuzzy search
+ *   ┌ header (1 row, brand + version, no border)
+ *   │ ┌ sidebar (28 cols) ┐  ┌ terminal (rest) ──────────┐
+ *   │ │ Sessions          │  │                            │
+ *   │ │ ▶ demo-1 ●        │  │  thurbox-v2$               │
+ *   │ │                   │  │                            │
+ *   │ └───────────────────┘  └────────────────────────────┘
+ *   └ footer (1 row, keybind hints, no border)
  *
- * Input forwarding: when the terminal pane is focused, every keystroke
- * goes through `keyEventToBytes` and is written to the active session.
+ * The terminal size is computed from the host screen via `useStdout()` so
+ * the PaneTerminal is created with the correct rows/cols and resizes when
+ * the user resizes their terminal.
+ *
+ * Side effects (PTY, xterm, DB) live in refs; React Fast Refresh tears
+ * down the View tree but never the refs.
  */
 
-import { Box, Text, useApp as useInkApp, useInput } from 'ink';
+import { Box, Text, useApp as useInkApp, useInput, useStdout } from 'ink';
 import { useEffect, useRef, useState } from 'react';
 import { LocalTmuxBackend } from '../daemon/backends/LocalTmuxBackend.ts';
 import type { SessionBackend } from '../daemon/backends/SessionBackend.ts';
@@ -33,17 +32,37 @@ import { Terminal as TerminalView } from './Terminal.tsx';
 import { ThemePicker } from './ThemePicker.tsx';
 import { keyEventToBytes } from './keymap.ts';
 
-const ROWS = 20;
-const COLS = 80;
+const SIDEBAR_WIDTH = 28;
+const HEADER_HEIGHT = 1;
+const FOOTER_HEIGHT = 1;
+const BORDERS_OVERHEAD = 2; // top + bottom border of the terminal panel
 const SNAPSHOT_FPS = 30;
 
 type Status = 'booting' | 'ready' | 'error';
 
+interface Size {
+  rows: number;
+  cols: number;
+}
+
+/** Compute the inner terminal-pane dimensions from the host screen size. */
+function terminalSize(host: Size): Size {
+  const rows = Math.max(5, host.rows - HEADER_HEIGHT - FOOTER_HEIGHT - BORDERS_OVERHEAD);
+  // Sidebar takes its width + its own two borders + 1 col gap.
+  const cols = Math.max(20, host.cols - SIDEBAR_WIDTH - BORDERS_OVERHEAD);
+  return { rows, cols };
+}
+
 export function App() {
   const { exit } = useInkApp();
+  const { stdout } = useStdout();
   const theme = useTheme();
   const [bootStatus, setBootStatus] = useState<Status>('booting');
   const [error, setError] = useState<string | null>(null);
+  const [hostSize, setHostSize] = useState<Size>({
+    rows: stdout?.rows ?? 24,
+    cols: stdout?.columns ?? 80,
+  });
 
   const sessions = useApp((s) => s.sessions);
   const activeId = useApp((s) => s.activeSessionId);
@@ -60,6 +79,18 @@ export function App() {
 
   const backendRef = useRef<SessionBackend | null>(null);
   const dbRef = useRef<DB | null>(null);
+
+  // Track host resizes.
+  useEffect(() => {
+    if (!stdout) return;
+    const update = () => setHostSize({ rows: stdout.rows ?? 24, cols: stdout.columns ?? 80 });
+    stdout.on('resize', update);
+    return () => {
+      stdout.off('resize', update);
+    };
+  }, [stdout]);
+
+  const termSize = terminalSize(hostSize);
 
   // Boot: tmux backend + SQLite + initial demo session.
   // biome-ignore lint/correctness/useExhaustiveDependencies: bootstrap runs once; Zustand setters are stable refs
@@ -78,7 +109,7 @@ export function App() {
         if (cancelled) return;
         backendRef.current = backend;
 
-        await spawnDemoSession(backend, 'demo-1');
+        await spawnDemoSession(backend, 'demo-1', termSize);
         setBootStatus('ready');
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e));
@@ -87,9 +118,6 @@ export function App() {
     })();
     return () => {
       cancelled = true;
-      // Kill all live sessions on app exit. We don't `detach()` here because
-      // that would leave tmux state behind; for the M6 demo a hard kill is
-      // fine. M8 wires Ctrl+Q to detach instead.
       const b = backendRef.current;
       if (b) {
         for (const [id, h] of sessionHandles.entries()) {
@@ -102,8 +130,19 @@ export function App() {
     };
   }, []);
 
-  // Persist theme changes to SQLite (debounced via the next-tick microtask
-  // — the store update + a single fast DB write is cheap).
+  // Resize all panes when the host screen changes.
+  useEffect(() => {
+    if (bootStatus !== 'ready') return;
+    const b = backendRef.current;
+    for (const handle of sessionHandles.values()) {
+      handle.pane.resize(termSize.rows, termSize.cols);
+      b?.resize(handle.backendSession.backendId, termSize.rows, termSize.cols).catch(
+        () => undefined,
+      );
+    }
+  }, [bootStatus, termSize.rows, termSize.cols]);
+
+  // Persist theme changes to SQLite.
   const themeKey = useApp((s) => s.theme);
   useEffect(() => {
     if (bootStatus !== 'ready') return;
@@ -126,74 +165,32 @@ export function App() {
     return () => clearInterval(id);
   }, [bootStatus, activeId, setSnapshot]);
 
-  // Global key handler. Order matters: modal handlers swallow keys first
-  // (their own `useInput` runs because they're mounted children of App).
+  // Global key handler.
   useInput((input, key) => {
     if (modal !== 'none') return;
+    if (key.ctrl && input === 'q') return exit();
+    if (key.ctrl && input === 'y') return openModal('themePicker');
 
-    // Ctrl+Q quit
-    if (key.ctrl && input === 'q') {
-      exit();
-      return;
-    }
-    // Ctrl+Y or F4: theme picker
-    if (key.ctrl && input === 'y') {
-      openModal('themePicker');
-      return;
-    }
-    // (F4 isn't exposed by Ink's Key — handled via raw escape sequence in M6b)
-
-    // Sidebar-focused navigation
     if (focusedPane === 'list') {
-      if (input === '/') {
-        openModal('fuzzySearch');
-        return;
-      }
-      if (key.ctrl && input === 'j') {
-        cycleSession(1);
-        return;
-      }
-      if (key.ctrl && input === 'k') {
-        cycleSession(-1);
-        return;
-      }
-      if (key.ctrl && (input === 'l' || input === 'h')) {
-        focus(input === 'l' ? 'terminal' : 'list');
-        return;
-      }
-      if (key.return) {
-        focus('terminal');
-        return;
-      }
-      // Ctrl+N: spawn another demo session (M6b replaces with the modal flow)
+      if (input === '/') return openModal('fuzzySearch');
+      if (key.ctrl && input === 'j') return cycleSession(1);
+      if (key.ctrl && input === 'k') return cycleSession(-1);
+      if (key.ctrl && input === 'l') return focus('terminal');
+      if (key.ctrl && input === 'h') return focus('list');
+      if (key.return) return focus('terminal');
       if (key.ctrl && input === 'n') {
         const b = backendRef.current;
-        if (b) spawnDemoSession(b, `demo-${sessions.length + 1}`).catch(() => undefined);
+        if (b) spawnDemoSession(b, `demo-${sessions.length + 1}`, termSize).catch(() => undefined);
         return;
       }
-      if (key.ctrl && input === 'd' && activeId) {
-        closeSession(activeId);
-        return;
-      }
+      if (key.ctrl && input === 'd' && activeId) return closeSession(activeId);
       return;
     }
 
-    // Terminal-focused: forward to PTY.
     if (focusedPane === 'terminal') {
-      // Ctrl+H exits terminal focus back to the sidebar.
-      if (key.ctrl && input === 'h') {
-        focus('list');
-        return;
-      }
-      // Ctrl+J / Ctrl+K still cycle sessions even when terminal is focused.
-      if (key.ctrl && input === 'j') {
-        cycleSession(1);
-        return;
-      }
-      if (key.ctrl && input === 'k') {
-        cycleSession(-1);
-        return;
-      }
+      if (key.ctrl && input === 'h') return focus('list');
+      if (key.ctrl && input === 'j') return cycleSession(1);
+      if (key.ctrl && input === 'k') return cycleSession(-1);
       if (!activeId) return;
       const handle = sessionHandles.get(activeId);
       if (!handle) return;
@@ -221,39 +218,32 @@ export function App() {
     removeSession(id);
   }
 
-  async function spawnDemoSession(b: SessionBackend, name: string): Promise<void> {
+  async function spawnDemoSession(b: SessionBackend, name: string, size: Size): Promise<void> {
     const id = crypto.randomUUID();
     const s = await b.spawn({
       windowName: name,
       command: 'sh',
       args: ['-i'],
       env: { PS1: 'thurbox-v2$ ' },
-      rows: ROWS,
-      cols: COLS,
+      rows: size.rows,
+      cols: size.cols,
     });
-    const pane = new PaneTerminal(ROWS, COLS);
+    const pane = new PaneTerminal(size.rows, size.cols);
     pane.attach(s.output);
     sessionHandles.set(id, { backendSession: s, pane });
-    addSession({
-      id,
-      name,
-      role: null,
-      branch: null,
-      status: 'Running',
-      cwd: null,
-    });
+    addSession({ id, name, role: null, branch: null, status: 'Running', cwd: null });
   }
 
   if (bootStatus === 'booting') {
     return (
-      <Box borderStyle="round" borderColor={theme.borderFocused} padding={1}>
+      <Box>
         <Text color={theme.accent}>booting…</Text>
       </Box>
     );
   }
   if (bootStatus === 'error') {
     return (
-      <Box flexDirection="column" borderStyle="round" borderColor={theme.statusError} padding={1}>
+      <Box flexDirection="column">
         <Text color={theme.statusError}>error: {error}</Text>
         <Text color={theme.muted} dimColor>
           Ctrl+Q to exit.
@@ -262,41 +252,65 @@ export function App() {
     );
   }
 
+  // Main layout: header row, body row (sidebar + terminal), footer row.
+  const sidebarFocused = focusedPane === 'list' && modal === 'none';
+  const terminalFocused = focusedPane === 'terminal' && modal === 'none';
+
   return (
-    <Box flexDirection="column">
-      <Box>
-        <SessionList theme={theme} focused={focusedPane === 'list' && modal === 'none'} />
-        <Box flexDirection="column" marginLeft={1} flexGrow={1}>
-          <Box
-            borderStyle="round"
-            borderColor={
-              focusedPane === 'terminal' && modal === 'none'
-                ? theme.borderFocused
-                : theme.borderUnfocused
-            }
-          >
-            {snapshot ? (
-              <TerminalView snapshot={snapshot} width={COLS} />
-            ) : (
-              <Text color={theme.muted}>(no active session)</Text>
-            )}
-          </Box>
-        </Box>
-      </Box>
-      <Box>
+    <Box flexDirection="column" width={hostSize.cols} height={hostSize.rows}>
+      {/* Header */}
+      <Box height={HEADER_HEIGHT}>
+        <Text bold color={theme.accent}>
+          {' thurbox'}
+        </Text>
+        <Text color={theme.muted}>{'  Multi-Session Agent Orchestrator'}</Text>
         <Text color={theme.muted} dimColor>
-          {focusedPane === 'list'
-            ? 'Ctrl+J/K · Enter focus pane · / search · Ctrl+N new · Ctrl+D close · Ctrl+Y theme · Ctrl+Q quit'
-            : 'Ctrl+H back · Ctrl+J/K switch session · keys forward to PTY · Ctrl+Q quit'}
+          {'  v0.0.0-dev'}
         </Text>
       </Box>
+
+      {/* Body */}
+      <Box flexGrow={1}>
+        <SessionList theme={theme} focused={sidebarFocused} width={SIDEBAR_WIDTH} />
+        <Box
+          flexDirection="column"
+          flexGrow={1}
+          borderStyle="single"
+          borderColor={terminalFocused ? theme.borderFocused : theme.borderUnfocused}
+          paddingX={0}
+        >
+          {snapshot ? (
+            <TerminalView snapshot={snapshot} width={termSize.cols} height={termSize.rows} />
+          ) : (
+            <Text color={theme.muted}>(no active session)</Text>
+          )}
+        </Box>
+      </Box>
+
+      {/* Footer */}
+      <Box height={FOOTER_HEIGHT}>
+        <Text color={theme.muted} dimColor>
+          {sidebarFocused
+            ? 'Ctrl+J/K · Enter focus · / search · Ctrl+N new · Ctrl+D close · Ctrl+Y theme · Ctrl+Q quit'
+            : 'Ctrl+H back · Ctrl+J/K switch · keys forward to PTY · Ctrl+Q quit'}
+        </Text>
+      </Box>
+
       {modal === 'themePicker' && (
-        <Box marginTop={1}>
+        <Box
+          position="absolute"
+          marginTop={3}
+          marginLeft={Math.max(2, Math.floor(hostSize.cols / 2) - 20)}
+        >
           <ThemePicker theme={theme} />
         </Box>
       )}
       {modal === 'fuzzySearch' && (
-        <Box marginTop={1}>
+        <Box
+          position="absolute"
+          marginTop={3}
+          marginLeft={Math.max(2, Math.floor(hostSize.cols / 2) - 25)}
+        >
           <FuzzySearch theme={theme} />
         </Box>
       )}
