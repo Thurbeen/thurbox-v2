@@ -24,6 +24,9 @@
  */
 
 import { type ChildProcessByStdio, spawn as cpSpawn, spawnSync } from 'node:child_process';
+import { existsSync, unlinkSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import type { Readable, Writable } from 'node:stream';
 import { formatSendKeys, parseNotification } from './protocol.ts';
 
@@ -144,7 +147,32 @@ export class ControlMode {
     //    behaves correctly. Both are available under Bun's compat layer, so
     //    this only affects the runtime path, not the build.
     const env = tmuxEnv();
-    spawnSync(
+
+    // Sweep stale socket files. `tmux kill-server` exits 0 ("no server") and
+    // does NOT unlink the socket inode. If a previous tmux server crashed
+    // mid-attach, that stale file pins the socket name into "server exited
+    // unexpectedly" state — every subsequent operation on this socket fails
+    // immediately until the file is removed. We detect that by trying a
+    // benign `list-sessions`: a healthy/missing server returns code 1 with
+    // "no server running" on stderr; a stale socket returns code 1 with
+    // "server exited unexpectedly".
+    const probe = spawnSync('tmux', ['-L', this.socket, 'list-sessions'], {
+      env,
+      stdio: ['ignore', 'ignore', 'pipe'],
+      encoding: 'utf-8',
+    });
+    if (probe.stderr?.includes('server exited unexpectedly')) {
+      const socketPath = join(tmpdir(), `tmux-${process.getuid?.() ?? 0}`, this.socket);
+      if (existsSync(socketPath)) {
+        try {
+          unlinkSync(socketPath);
+        } catch {
+          // best-effort; new-session below will surface the real error
+        }
+      }
+    }
+
+    const ns = spawnSync(
       'tmux',
       [
         '-L',
@@ -158,8 +186,11 @@ export class ControlMode {
         '-y',
         String(rows),
       ],
-      { env, stdio: 'ignore' },
+      { env, stdio: ['ignore', 'ignore', 'pipe'], encoding: 'utf-8' },
     );
+    if (ns.status !== 0 && !ns.stderr?.includes('duplicate session')) {
+      throw new Error(`tmux new-session failed: ${ns.stderr?.trim() ?? 'unknown error'}`);
+    }
 
     // 2. Attach in control mode via plain pipes.
     this.proc = cpSpawn('tmux', ['-L', this.socket, '-C', 'attach-session', '-t', this.session], {
@@ -179,11 +210,14 @@ export class ControlMode {
       stderrBuf += chunk;
     });
 
-    this.proc.on('exit', (code, signal) => {
-      // M4 replaces this with a file logger (stdout would corrupt the TUI).
-      console.error(
-        `[tmux control] proc exit code=${code} signal=${signal} stderr=${JSON.stringify(stderrBuf)}`,
-      );
+    this.proc.on('exit', (code) => {
+      // Non-zero exit + non-empty stderr is the interesting case; surface it
+      // on the next pending response (if any). M4 will route this through a
+      // proper file logger so it shows up in the TUI status bar too.
+      if (code !== 0 && stderrBuf.length > 0 && this.pending.length > 0) {
+        const head = this.pending.shift();
+        head?.resolver.reject(new Error(`tmux exited: ${stderrBuf.trim()}`));
+      }
       this.onExit();
     });
 
