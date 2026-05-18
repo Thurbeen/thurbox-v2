@@ -13,17 +13,14 @@
  * stored version forward to SCHEMA_VERSION inside a single transaction.
  */
 
+import { Database } from 'bun:sqlite';
 import { existsSync, mkdirSync } from 'node:fs';
-import { createRequire } from 'node:module';
 import { dirname } from 'node:path';
 import { DATABASE_FILE } from './paths.ts';
 
-// better-sqlite3 is a native CJS module. Vite/Vitest's bundler chokes on
-// the binary; loading via `createRequire` defers to Node's resolver so the
-// .node addon is loaded the normal way.
-const _require = createRequire(import.meta.url);
-const Database: typeof import('better-sqlite3') = _require('better-sqlite3');
-type DatabaseInstance = import('better-sqlite3').Database;
+// Bun's built-in `bun:sqlite` is a near drop-in for `better-sqlite3`. We
+// renamed the locally-used type so the rest of the file reads the same.
+type DatabaseInstance = Database;
 
 export const SCHEMA_VERSION = 1;
 
@@ -91,8 +88,8 @@ export class DB {
       mkdirSync(dirname(path), { recursive: true });
     }
     this.db = new Database(path);
-    this.db.pragma('journal_mode = WAL');
-    this.db.pragma('foreign_keys = ON');
+    this.db.exec('PRAGMA journal_mode = WAL');
+    this.db.exec('PRAGMA foreign_keys = ON');
     this.migrate();
   }
 
@@ -100,10 +97,10 @@ export class DB {
     this.db.close();
   }
 
-  /** Returns the current data_version — increments on any commit. */
+  /** Returns the current data_version — increments on commits by OTHER connections. */
   dataVersion(): number {
-    const row = this.db.pragma('data_version', { simple: true });
-    return typeof row === 'number' ? row : Number(row);
+    const row = this.db.query('PRAGMA data_version').get() as { data_version: number } | null;
+    return row?.data_version ?? 0;
   }
 
   // ---------- sessions ----------
@@ -113,7 +110,7 @@ export class DB {
     this.db
       .prepare(
         `INSERT INTO sessions (id, name, role, status, agent_session_id, backend_type, backend_id, cwd, branch, created_at, deleted_at)
-         VALUES (@id, @name, @role, @status, @agentSessionId, @backendType, @backendId, @cwd, @branch, @createdAt, NULL)
+         VALUES ($id, $name, $role, $status, $agentSessionId, $backendType, $backendId, $cwd, $branch, $createdAt, NULL)
          ON CONFLICT(id) DO UPDATE SET
            name = excluded.name,
            role = excluded.role,
@@ -125,7 +122,18 @@ export class DB {
            branch = excluded.branch,
            deleted_at = NULL`,
       )
-      .run({ ...s, createdAt: s.createdAt ?? now });
+      .run({
+        $id: s.id,
+        $name: s.name,
+        $role: s.role,
+        $status: s.status,
+        $agentSessionId: s.agentSessionId,
+        $backendType: s.backendType,
+        $backendId: s.backendId,
+        $cwd: s.cwd,
+        $branch: s.branch,
+        $createdAt: s.createdAt ?? now,
+      });
   }
 
   listSessions(includeDeleted = false): SessionRow[] {
@@ -178,12 +186,17 @@ export class DB {
     this.db
       .prepare(
         `INSERT INTO worktrees (session_id, repo_path, worktree_path, branch)
-         VALUES (@sessionId, @repoPath, @worktreePath, @branch)
+         VALUES ($sessionId, $repoPath, $worktreePath, $branch)
          ON CONFLICT(session_id, repo_path) DO UPDATE SET
            worktree_path = excluded.worktree_path,
            branch = excluded.branch`,
       )
-      .run(w);
+      .run({
+        $sessionId: w.sessionId,
+        $repoPath: w.repoPath,
+        $worktreePath: w.worktreePath,
+        $branch: w.branch,
+      });
   }
 
   getWorktreesForSession(sessionId: string): WorktreeRow[] {

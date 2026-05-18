@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import { PaneTerminal } from '../src/daemon/terminal.ts';
 
 const enc = new TextEncoder();

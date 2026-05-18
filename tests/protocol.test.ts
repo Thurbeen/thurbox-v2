@@ -2,7 +2,7 @@
  * Golden-test the tmux control-mode parser against v1's known-good cases
  * (src/agent/control_mode.rs, mod tests).
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it } from 'bun:test';
 import {
   decodeOctal,
   formatSendKeys,
